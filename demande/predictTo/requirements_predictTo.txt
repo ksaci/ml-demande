@@ -1,0 +1,22 @@
+# Requirements pour l'entraînement du modèle XGBoost
+# Installation : pip install -r requirements_xgboost.txt
+
+# Core Data Science
+pandas>=1.5.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+xgboost>=2.0.0
+joblib>=1.2.0
+
+# Visualisation
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# Azure Storage
+azure-storage-blob>=12.19.0
+azure-core>=1.29.0
+
+# Utilitaires
+python-dotenv>=1.0.0  # Pour charger les variables d'environnement depuis .env
+pyyaml>=6.0  # Pour charger la configuration depuis YAML (optionnel)
+

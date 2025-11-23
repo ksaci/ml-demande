@@ -1,0 +1,58 @@
+# Fichiers d'environnement avec secrets
+.env
+*.env
+.env.*
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Fichiers de distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environnements virtuels
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Données sensibles
+*.key
+*.pem
+*.p12
+secrets/
+
+# Résultats de modèles (si volumineux)
+# results/models/*.joblib
+# results/models/*.pkl
+

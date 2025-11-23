@@ -1,0 +1,44 @@
+# Configuration du modèle XGBoost pour la prédiction du TO
+# =========================================================
+
+# Chemins des données (relatifs au dossier predictTo/)
+data:
+  clustering_results: "../results/clustering_results.csv"
+  indicateurs: "../data/Indicateurs.csv"
+
+# Paramètres de prédiction
+prediction:
+  horizon: 7  # Prédire TO à J+7
+
+# Split des données
+training:
+  test_size: 0.2  # 20% pour le test
+  random_state: 42  # Pour la reproductibilité
+
+# Hyperparamètres du modèle XGBoost
+model:
+  n_estimators: 600        # Nombre d'arbres
+  learning_rate: 0.05      # Taux d'apprentissage
+  max_depth: 7             # Profondeur maximale des arbres
+  subsample: 0.9           # Échantillonnage des lignes (90%)
+  colsample_bytree: 0.9    # Échantillonnage des colonnes (90%)
+  min_child_weight: 1      # Poids minimum des feuilles
+  reg_lambda: 1.0          # Régularisation L2
+  n_jobs: -1               # Utiliser tous les CPU disponibles
+
+# Configuration Azure Blob Storage
+azure:
+  container_name: "prediction-demande"
+  save_to_blob: true  # Activer/désactiver la sauvegarde Azure
+
+# Options de sortie
+output:
+  model_dir: "../results/models"
+  save_plots: true
+  log_file: "predictTo_training.log"
+
+# Notes:
+# - Pour désactiver la sauvegarde Azure, mettre azure.save_to_blob à false
+# - Pour modifier les hyperparamètres, ajustez la section 'model'
+# - Le random_state garantit des résultats reproductibles
+
