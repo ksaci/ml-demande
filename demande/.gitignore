@@ -1,7 +1,11 @@
 # Fichiers d'environnement avec secrets
 .env
-*.env
-.env.*
+.env.local
+.env.*.local
+
+# Autoriser les fichiers d'exemple
+!.env.example
+!*.env.example
 
 # Cache Python
 __pycache__/
