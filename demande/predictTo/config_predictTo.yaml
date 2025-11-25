@@ -3,12 +3,13 @@
 
 # Chemins des données (relatifs au dossier predictTo/)
 data:
-  clustering_results: "../results/clustering_results.csv"
-  indicateurs: "../data/Indicateurs.csv"
+  clustering_results: "../results/D09/clustering_results.csv"
+  indicateurs: "../data/D09/Indicateurs.csv"
+  rateShopper: "../data/D09/rateShopper.csv"  # Prix des concurrents
 
 # Paramètres de prédiction
 prediction:
-  horizon: 7  # Prédire TO à J+7
+  horizon: 45  # Prédire TO à J+7
 
 # Split des données
 training:
@@ -33,12 +34,19 @@ azure:
 
 # Options de sortie
 output:
-  model_dir: "../results/models"
+  model_dir: "results/D09/models"
   save_plots: true
   log_file: "predictTo_training.log"
+
+# Recherche d'hyperparamètres (optionnel, utilisé avec --search-hyperparams)
+hyperparam_search:
+  n_iter: 30        # Nombre d'itérations pour la recherche randomisée
+  cv_folds: 3       # Nombre de folds pour la cross-validation
 
 # Notes:
 # - Pour désactiver la sauvegarde Azure, mettre azure.save_to_blob à false
 # - Pour modifier les hyperparamètres, ajustez la section 'model'
+# - Pour activer la recherche d'hyperparamètres: python predictTo_train_model.py --search-hyperparams
+# - Randomized Search teste n_iter combinaisons aléatoires (plus rapide que Grid Search)
 # - Le random_state garantit des résultats reproductibles
 

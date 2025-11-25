@@ -25,12 +25,20 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError
+import holidays
+
+# Import optionnel pour vacances scolaires
+try:
+    from vacances_scolaires_france import SchoolHolidayDates
+    SCHOOL_HOLIDAYS_AVAILABLE = True
+except ImportError:
+    SCHOOL_HOLIDAYS_AVAILABLE = False
 
 # Import optionnel pour YAML
 try:
@@ -153,18 +161,203 @@ class XGBoostOccupancyPredictor:
             logger.error(f"Erreur lors du chargement des données: {e}")
             raise
     
-    def compute_pm_features(self, pm_series_raw: pd.Series) -> Dict[str, float]:
+    def load_competitor_prices(self, rateShopper_path: str) -> pd.DataFrame:
         """
-        Calcule les features compressées à partir d'une série de PM.
+        Charge les prix des concurrents depuis le fichier rateShopper.
         
         Args:
-            pm_series_raw: Série temporelle des prix moyens
+            rateShopper_path: Chemin vers le fichier rateShopper.csv
+            
+        Returns:
+            DataFrame avec les prix des concurrents
+        """
+        try:
+            logger.info(f"Chargement des prix concurrents depuis {rateShopper_path}...")
+            df_comp = pd.read_csv(rateShopper_path, sep=';')
+            
+            # Renommer les colonnes pour cohérence
+            df_comp = df_comp.rename(columns={
+                'HotCode': 'hotCode',
+                'Date': 'Date',
+                'DateImport': 'ObsDate'
+            })
+            
+            logger.info(f"Prix concurrents chargés: {df_comp.shape}")
+            return df_comp
+            
+        except FileNotFoundError:
+            logger.warning(f"⚠️  Fichier {rateShopper_path} non trouvé. Les features concurrentes ne seront pas ajoutées.")
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️  Erreur lors du chargement des prix concurrents: {e}")
+            return None
+    
+    def prepare_competitor_features(self, df: pd.DataFrame, df_comp: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prépare les features à partir des prix médians des concurrents.
+        
+        Args:
+            df: DataFrame principal avec stay_date et hotCode
+            df_comp: DataFrame des prix concurrents
+            
+        Returns:
+            DataFrame enrichi avec les features concurrentes (prix médian uniquement)
+        """
+        if df_comp is None:
+            logger.info("Pas de données concurrentes disponibles")
+            return df
+        
+        logger.info("Préparation des features concurrentes (prix médian)...")
+        
+        # Convertir les dates et retirer les informations de timezone
+        df_comp["Date"] = pd.to_datetime(df_comp["Date"]).dt.tz_localize(None)
+        df_comp["ObsDate"] = pd.to_datetime(df_comp["ObsDate"]).dt.tz_localize(None)
+        
+        # Calculer la distance J-x
+        df_comp["days_before"] = (df_comp["Date"] - df_comp["ObsDate"]).dt.days
+        
+        # Garder uniquement J-0 → J-60
+        df_comp = df_comp[
+            (df_comp["days_before"] >= 0) & 
+            (df_comp["days_before"] <= 60)
+        ]
+        
+        # Pivoter les données pour le prix médian uniquement
+        pivot = df_comp.pivot_table(
+            index=["hotCode", "Date"],
+            columns="days_before",
+            values="CompPrixMedian",
+            aggfunc="last"
+        )
+        
+        pivot.columns = [f"CompPrixMedian_J-{col}" for col in pivot.columns]
+        pivot = pivot.reset_index()
+        
+        # Récupérer les colonnes de séries temporelles (uniquement J-horizon à J-60)
+        horizon = self.config['prediction_horizon']
+        comp_cols_all = [c for c in pivot.columns if c.startswith("CompPrixMedian_J-")]
+        comp_cols_available = []
+        for col in comp_cols_all:
+            # Extraire le numéro de J-X
+            j_num = int(col.split("J-")[1])
+            if j_num >= horizon:  # Seulement les données de J-horizon et au-delà
+                comp_cols_available.append(col)
+        
+        comp_cols_available = sorted(comp_cols_available, key=lambda x: int(x.split("J-")[1]))
+        
+        logger.info(f"   Features concurrentes calculées sur J-{horizon} à J-60")
+        
+        # Convertir en numérique
+        pivot[comp_cols_available] = pivot[comp_cols_available].apply(
+            lambda col: pd.to_numeric(col, errors='coerce')
+        )
+        
+        # Fusionner le pivot Comp avec le DataFrame principal pour avoir PM et Comp alignés
+        df = df.merge(
+            pivot,
+            left_on=["hotCode", "stay_date"],
+            right_on=["hotCode", "Date"],
+            how="left"
+        ).drop(columns=["Date"], errors='ignore')
+        
+        logger.info("Construction des séries Gap et Elasticity...")
+        
+        # Construire les colonnes PM correspondantes (même horizon)
+        pm_cols_for_gap = []
+        for col in comp_cols_available:
+            j_num = col.split("J-")[1]
+            pm_col = f"pm_J-{j_num}"
+            if pm_col in df.columns:
+                pm_cols_for_gap.append(pm_col)
+        
+        # Calculer les features Gap et Elasticity pour chaque ligne
+        features_list = []
+        for idx, row in df.iterrows():
+            # Récupérer les séries PM et Comp
+            pm_series = row[pm_cols_for_gap].values
+            comp_series = row[comp_cols_available].values
+            
+            # Convertir en arrays numériques
+            pm_arr = pd.to_numeric(pd.Series(pm_series), errors='coerce').replace([np.inf, -np.inf], np.nan).values
+            comp_arr = pd.to_numeric(pd.Series(comp_series), errors='coerce').replace([np.inf, -np.inf], np.nan).values
+            
+            # 1. Gap series = PM - Comp
+            gap_series = pm_arr - comp_arr
+            gap_valid = pd.Series(gap_series).dropna()
+            
+            if len(gap_valid) >= 1:
+                gap_last = float(gap_valid.iloc[0])  # Première valeur = J-horizon
+                if len(gap_valid) >= 2:
+                    x = np.arange(len(gap_valid))
+                    gap_slope = float(np.polyfit(x, gap_valid.values, 1)[0])
+                else:
+                    gap_slope = 0.0
+            else:
+                gap_last = 0.0
+                gap_slope = 0.0
+            
+            # 2. Elasticity series = PM / Comp
+            elasticity_series = pm_arr / np.where(comp_arr == 0, np.nan, comp_arr)
+            elasticity_valid = pd.Series(elasticity_series).dropna()
+            
+            if len(elasticity_valid) >= 1:
+                elasticity_last = float(elasticity_valid.iloc[0])  # Première valeur = J-horizon
+                if len(elasticity_valid) >= 2:
+                    x = np.arange(len(elasticity_valid))
+                    elasticity_slope = float(np.polyfit(x, elasticity_valid.values, 1)[0])
+                else:
+                    elasticity_slope = 0.0
+            else:
+                elasticity_last = 1.0  # Valeur neutre si pas de données
+                elasticity_slope = 0.0
+            
+            # Features compressées classiques sur Comp
+            comp_series_clean = pd.Series(comp_series)
+            feats_comp = self.compute_price_features(comp_series_clean, prefix="comp")
+            
+            # Ajouter toutes les features
+            feats = {
+                'hotCode': row['hotCode'],
+                'stay_date_key': row['stay_date'],
+                'gap_last': gap_last,
+                'gap_slope': gap_slope,
+                'elasticity_last': elasticity_last,
+                'elasticity_slope': elasticity_slope,
+                **feats_comp
+            }
+            features_list.append(feats)
+        
+        df_all_feats = pd.DataFrame(features_list)
+        
+        # Fusionner avec le DataFrame principal
+        df = df.merge(
+            df_all_feats,
+            left_on=["hotCode", "stay_date"],
+            right_on=["hotCode", "stay_date_key"],
+            how="left"
+        ).drop(columns=["stay_date_key"], errors='ignore')
+        
+        # Supprimer les colonnes pivotées CompPrixMedian_J-X pour alléger
+        cols_to_drop = [c for c in df.columns if c.startswith("CompPrixMedian_J-")]
+        df = df.drop(columns=cols_to_drop, errors='ignore')
+        
+        logger.info(f"Features concurrentes + Gap/Elasticity ajoutées (10 features). Shape: {df.shape}")
+        
+        return df
+    
+    def compute_price_features(self, price_series_raw: pd.Series, prefix: str = "pm") -> Dict[str, float]:
+        """
+        Calcule les features compressées à partir d'une série de prix.
+        
+        Args:
+            price_series_raw: Série temporelle des prix
+            prefix: Préfixe pour les noms des features (ex: "pm", "comp_min", etc.)
             
         Returns:
             Dictionnaire des features calculées
         """
         # Conversion en Series pour utiliser les outils pandas
-        s = pd.Series(pm_series_raw)
+        s = pd.Series(price_series_raw)
         
         # Conversion en numérique (float), tout ce qui n'est pas convertible -> NaN
         s = pd.to_numeric(s, errors='coerce')
@@ -175,13 +368,12 @@ class XGBoostOccupancyPredictor:
         # Si tout est NaN -> on renvoie des 0 safe
         if s.isna().all():
             return {
-                "pm_mean": 0.0,
-                "pm_slope": 0.0,
-                "pm_volatility": 0.0,
-                "pm_diff_sum": 0.0,
-                "pm_change_ratio": 0.0,
-                "pm_last_jump": 0.0,
-                "pm_trend_changes": 0,
+                f"{prefix}_slope": 0.0,
+                f"{prefix}_volatility": 0.0,
+                f"{prefix}_diff_sum": 0.0,
+                f"{prefix}_change_ratio": 0.0,
+                f"{prefix}_last_jump": 0.0,
+                f"{prefix}_trend_changes": 0,
             }
         
         # Si après interpolation il reste moins de 2 points valides -> pas de pente possible
@@ -189,50 +381,62 @@ class XGBoostOccupancyPredictor:
         if len(valid) < 2:
             v = float(valid.iloc[0]) if len(valid) == 1 else 0.0
             return {
-                "pm_mean": v,
-                "pm_slope": 0.0,
-                "pm_volatility": 0.0,
-                "pm_diff_sum": 0.0,
-                "pm_change_ratio": 0.0,
-                "pm_last_jump": 0.0,
-                "pm_trend_changes": 0,
+                f"{prefix}_slope": 0.0,
+                f"{prefix}_volatility": 0.0,
+                f"{prefix}_diff_sum": 0.0,
+                f"{prefix}_change_ratio": 0.0,
+                f"{prefix}_last_jump": 0.0,
+                f"{prefix}_trend_changes": 0,
             }
         
         arr = valid.to_numpy()
         
-        pm_mean = float(arr.mean())
-        pm_volatility = float(arr.std())
-        pm_diff_sum = float(np.sum(np.abs(np.diff(arr))))
-        
-        # Pente (pm_slope)
-        x = np.arange(len(arr), dtype=float)
-        pm_slope = float(np.polyfit(x, arr, 1)[0])
+        slope = float(np.polyfit(np.arange(len(arr), dtype=float), arr, 1)[0])
+        volatility = float(arr.std())
+        diff_sum = float(np.sum(np.abs(np.diff(arr))))
         
         # Ratio global
         first = arr[0]
         last = arr[-1]
-        pm_change_ratio = float((last - first) / first) if first != 0 else 0.0
+        change_ratio = float((last - first) / first) if first != 0 else 0.0
         
         # Variation récente
         if len(arr) >= 6:
-            pm_last_jump = float(last - arr[-6])
+            last_jump = float(last - arr[-6])
         else:
-            pm_last_jump = float(last - first)
+            last_jump = float(last - first)
         
         # Changements de direction
         diffs = np.diff(arr)
         signs = np.sign(diffs)
-        pm_trend_changes = int(np.sum(np.diff(signs) != 0))
+        trend_changes = int(np.sum(np.diff(signs) != 0))
         
         return {
-            "pm_mean": pm_mean,
-            "pm_slope": pm_slope,
-            "pm_volatility": pm_volatility,
-            "pm_diff_sum": pm_diff_sum,
-            "pm_change_ratio": pm_change_ratio,
-            "pm_last_jump": pm_last_jump,
-            "pm_trend_changes": pm_trend_changes,
+            f"{prefix}_slope": slope,
+            f"{prefix}_volatility": volatility,
+            f"{prefix}_diff_sum": diff_sum,
+            f"{prefix}_change_ratio": change_ratio,
+            f"{prefix}_last_jump": last_jump,
+            f"{prefix}_trend_changes": trend_changes,
         }
+    
+    def compute_pm_features(self, pm_series_raw: pd.Series) -> Dict[str, float]:
+        """
+        Calcule les features compressées à partir d'une série de PM (rétrocompatibilité).
+        
+        Args:
+            pm_series_raw: Série temporelle des prix moyens
+            
+        Returns:
+            Dictionnaire des features calculées (avec préfixe pm et pm_mean)
+        """
+        features = self.compute_price_features(pm_series_raw, prefix="pm")
+        # Ajouter pm_mean pour compatibilité avec le code existant
+        s = pd.Series(pm_series_raw)
+        s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan)
+        valid = s.dropna()
+        features["pm_mean"] = float(valid.mean()) if len(valid) > 0 else 0.0
+        return features
     
     def prepare_data(self, clusters: pd.DataFrame, indicateurs: pd.DataFrame) -> pd.DataFrame:
         """
@@ -274,6 +478,32 @@ class XGBoostOccupancyPredictor:
         
         logger.info(f"PM pivot shape: {pm_pivot.shape}")
         
+        # Pivoter Ant (Anticipation)
+        ant_pivot = indicateurs.pivot_table(
+            index=["hotCode", "Date"],
+            columns="days_before",
+            values="Ant",
+            aggfunc="last"
+        )
+        
+        ant_pivot.columns = [f"ant_J-{col}" for col in ant_pivot.columns]
+        ant_pivot = ant_pivot.reset_index()
+        
+        logger.info(f"Ant pivot shape: {ant_pivot.shape}")
+        
+        # Pivoter Ds (Durée de séjour)
+        ds_pivot = indicateurs.pivot_table(
+            index=["hotCode", "Date"],
+            columns="days_before",
+            values="Ds",
+            aggfunc="last"
+        )
+        
+        ds_pivot.columns = [f"ds_J-{col}" for col in ds_pivot.columns]
+        ds_pivot = ds_pivot.reset_index()
+        
+        logger.info(f"Ds pivot shape: {ds_pivot.shape}")
+        
         # Fusionner avec les clusters
         df = clusters.merge(
             pm_pivot,
@@ -282,19 +512,49 @@ class XGBoostOccupancyPredictor:
             how="left"
         ).drop(columns=["Date"])
         
+        # Fusionner Ant
+        df = df.merge(
+            ant_pivot,
+            left_on=["hotCode", "stay_date"],
+            right_on=["hotCode", "Date"],
+            how="left"
+        ).drop(columns=["Date"])
+        
+        # Fusionner Ds
+        df = df.merge(
+            ds_pivot,
+            left_on=["hotCode", "stay_date"],
+            right_on=["hotCode", "Date"],
+            how="left"
+        ).drop(columns=["Date"])
+        
         logger.info(f"DataFrame fusionné: {df.shape}")
         
-        # Calculer les features PM compressées
-        pm_cols = [c for c in df.columns if c.startswith("pm_J-")]
+        # Calculer les features PM compressées (uniquement sur les données disponibles jusqu'à J-horizon)
+        horizon = self.config['prediction_horizon']
+        
+        # Filtrer les colonnes PM : de J-horizon à J-60 (pas de données futures !)
+        pm_cols_all = [c for c in df.columns if c.startswith("pm_J-")]
+        pm_cols_available = []
+        for col in pm_cols_all:
+            # Extraire le numéro de J-X
+            j_num = int(col.split("J-")[1])
+            if j_num >= horizon:  # Seulement les données de J-horizon et au-delà
+                pm_cols_available.append(col)
+        
+        pm_cols_available = sorted(pm_cols_available, key=lambda x: int(x.split("J-")[1]))
+        
+        logger.info(f"Calcul des features PM sur données J-{horizon} à J-60 (pas de data leakage)")
+        logger.info(f"   Colonnes PM utilisées: {len(pm_cols_available)}")
         
         # Convertir en numérique
-        df[pm_cols] = df[pm_cols].apply(
+        df[pm_cols_available] = df[pm_cols_available].apply(
             lambda col: pd.to_numeric(col, errors='coerce')
         )
         
         features_list = []
         for idx, row in df.iterrows():
-            pm_series = row[pm_cols].values
+            pm_series = row[pm_cols_available].values
             feats = self.compute_pm_features(pm_series)
             features_list.append(feats)
         
@@ -303,12 +563,226 @@ class XGBoostOccupancyPredictor:
         
         logger.info(f"Features PM ajoutées: {df.shape}")
         
+        # Calculer les features Ant (Anticipation) compressées
+        ant_cols_all = [c for c in df.columns if c.startswith("ant_J-")]
+        ant_cols_available = []
+        for col in ant_cols_all:
+            j_num = int(col.split("J-")[1])
+            if j_num >= horizon:
+                ant_cols_available.append(col)
+        
+        ant_cols_available = sorted(ant_cols_available, key=lambda x: int(x.split("J-")[1]))
+        
+        logger.info(f"Calcul des features Ant (anticipation) sur données J-{horizon} à J-60")
+        logger.info(f"   Colonnes Ant utilisées: {len(ant_cols_available)}")
+        
+        # Convertir en numérique
+        df[ant_cols_available] = df[ant_cols_available].apply(
+            lambda col: pd.to_numeric(col, errors='coerce')
+        )
+        
+        features_list = []
+        for idx, row in df.iterrows():
+            ant_series = row[ant_cols_available].values
+            feats = self.compute_price_features(ant_series, prefix="ant")
+            features_list.append(feats)
+        
+        df_feats_ant = pd.DataFrame(features_list)
+        df = pd.concat([df, df_feats_ant], axis=1)
+        
+        logger.info(f"Features Ant ajoutées: {df.shape}")
+        
+        # Calculer les features Ds (Durée de séjour) compressées
+        ds_cols_all = [c for c in df.columns if c.startswith("ds_J-")]
+        ds_cols_available = []
+        for col in ds_cols_all:
+            j_num = int(col.split("J-")[1])
+            if j_num >= horizon:
+                ds_cols_available.append(col)
+        
+        ds_cols_available = sorted(ds_cols_available, key=lambda x: int(x.split("J-")[1]))
+        
+        logger.info(f"Calcul des features Ds (durée séjour) sur données J-{horizon} à J-60")
+        logger.info(f"   Colonnes Ds utilisées: {len(ds_cols_available)}")
+        
+        # Convertir en numérique
+        df[ds_cols_available] = df[ds_cols_available].apply(
+            lambda col: pd.to_numeric(col, errors='coerce')
+        )
+        
+        features_list = []
+        for idx, row in df.iterrows():
+            ds_series = row[ds_cols_available].values
+            feats = self.compute_price_features(ds_series, prefix="ds")
+            features_list.append(feats)
+        
+        df_feats_ds = pd.DataFrame(features_list)
+        df = pd.concat([df, df_feats_ds], axis=1)
+        
+        logger.info(f"Features Ds ajoutées: {df.shape}")
+        
+        # Ajouter les features des prix concurrents
+        rateShopper_path = self.config.get('rateShopper_path', '../data/D09/rateShopper.csv')
+        df_comp = self.load_competitor_prices(rateShopper_path)
+        if df_comp is not None:
+            df = self.prepare_competitor_features(df, df_comp)
+        
         # Ajouter les features temporelles
         if not np.issubdtype(df["stay_date"].dtype, np.datetime64):
             df["stay_date"] = pd.to_datetime(df["stay_date"])
         
         df["month"] = df["stay_date"].dt.month
         df["dayofweek"] = df["stay_date"].dt.dayofweek
+        
+        # Ajouter ToF1 : TO final de l'année dernière (même date l'année précédente)
+        logger.info("Ajout de ToF1 (TO final année N-1)...")
+        if "J-0" in df.columns:
+            # Créer un DataFrame temporaire avec stay_date et J-0
+            df_to_last_year = df[["hotCode", "stay_date", "J-0"]].copy()
+            df_to_last_year["stay_date_next_year"] = df_to_last_year["stay_date"] + pd.DateOffset(years=1)
+            df_to_last_year = df_to_last_year.rename(columns={"J-0": "ToF1"})
+            
+            # Fusionner pour récupérer le TO de l'année précédente
+            df = df.merge(
+                df_to_last_year[["hotCode", "stay_date_next_year", "ToF1"]],
+                left_on=["hotCode", "stay_date"],
+                right_on=["hotCode", "stay_date_next_year"],
+                how="left"
+            ).drop(columns=["stay_date_next_year"])
+            
+            # Remplir les valeurs manquantes par 0 (pas de données pour l'année précédente)
+            df["ToF1"] = df["ToF1"].fillna(0)
+            
+            logger.info(f"   ToF1 ajouté : {(df['ToF1'] > 0).sum()} valeurs non-nulles sur {len(df)}")
+        else:
+            logger.warning("⚠️  Colonne J-0 non trouvée, ToF1 ne peut pas être calculé")
+            df["ToF1"] = 0
+        
+        # Features liées aux jours fériés français
+        logger.info("Ajout des features jours fériés...")
+        years_needed = range(
+            df["stay_date"].dt.year.min(),
+            df["stay_date"].dt.year.max() + 1
+        )
+
+        fr_holidays = holidays.France(years=list(years_needed))
+        # 1. Indicateur jour férié
+        df["is_holiday_fr"] = df["stay_date"].apply(
+            lambda x: 1 if x.date() in fr_holidays else 0
+        )
+        
+        # 2. Indicateur "pont" (jour avant ou après un férié)
+        df["is_bridge_day"] = df["stay_date"].apply(
+            lambda d: 1 if (
+                ((d - pd.Timedelta(days=1)).date() in fr_holidays) or 
+                ((d + pd.Timedelta(days=1)).date() in fr_holidays)
+            ) else 0
+        )
+        
+        # 3. Distance au prochain jour férié
+        def distance_to_next_holiday(date):
+            """Calcule le nombre de jours jusqu'au prochain jour férié."""
+            date_only = date.date()  # Convertir pd.Timestamp en datetime.date
+            
+            # Si c'est déjà un jour férié, distance = 0
+            if date_only in fr_holidays:
+                return 0
+            
+            # Chercher les jours fériés futurs et trier par date
+            upcoming = sorted([h for h in fr_holidays if h > date_only])
+            
+            if not upcoming:
+                return 90  # limite arbitraire si aucun férié à venir
+            
+            # Prendre le plus proche et limiter à 90 jours max
+            days_until = (upcoming[0] - date_only).days
+            return min(days_until, 90)
+        
+        df["days_to_holiday"] = df["stay_date"].apply(distance_to_next_holiday)
+        
+        # 4. Vacances scolaires françaises (toutes zones confondues)
+        logger.info("Ajout des vacances scolaires...")
+        if SCHOOL_HOLIDAYS_AVAILABLE:
+            school_holidays = SchoolHolidayDates()
+            
+            def is_school_holiday(date):
+                """Vérifie si la date est pendant les vacances scolaires (toutes zones)."""
+                d = date.date() if hasattr(date, 'date') else date
+                # Vérifier pour toutes les zones (A, B, C)
+                for zone in ['A', 'B', 'C']:
+                    if school_holidays.is_holiday_for_zone(d, zone):
+                        return 1
+                return 0
+            
+            df["is_vacances_scolaires"] = df["stay_date"].apply(is_school_holiday)
+        else:
+            logger.warning("⚠️  Librairie vacances-scolaires-france non disponible")
+            df["is_vacances_scolaires"] = 0
+        
+        # 5. Weekends prolongés (3 ou 4 jours)
+        logger.info("Ajout des weekends prolongés...")
+        
+        def is_long_weekend_3days(date):
+            """Détecte si la date fait partie d'un weekend de 3 jours."""
+            dow = date.dayofweek  # 0=lundi, 6=dimanche
+            d = date.date()  # Convertir pd.Timestamp en datetime.date
+            
+            # Configuration 1: Vendredi-Samedi-Dimanche (férié le vendredi)
+            if dow == 4 and d in fr_holidays:  # Vendredi férié
+                return 1
+            if dow == 5 and (date - pd.Timedelta(days=1)).date() in fr_holidays:  # Samedi après vendredi férié
+                return 1
+            if dow == 6 and (date - pd.Timedelta(days=2)).date() in fr_holidays:  # Dimanche après vendredi férié
+                return 1
+            
+            # Configuration 2: Samedi-Dimanche-Lundi (férié le lundi)
+            if dow == 0 and d in fr_holidays:  # Lundi férié
+                return 1
+            if dow == 5 and (date + pd.Timedelta(days=2)).date() in fr_holidays:  # Samedi avant lundi férié
+                return 1
+            if dow == 6 and (date + pd.Timedelta(days=1)).date() in fr_holidays:  # Dimanche avant lundi férié
+                return 1
+            
+            return 0
+        
+        def is_long_weekend_4days(date):
+            """Détecte si la date fait partie d'un weekend de 4 jours."""
+            dow = date.dayofweek  # 0=lundi, 6=dimanche
+            d = date.date()  # Convertir pd.Timestamp en datetime.date
+            
+            # Configuration 1: Jeudi-Vendredi-Samedi-Dimanche (fériés jeudi OU vendredi)
+            if dow == 3 and d in fr_holidays:  # Jeudi férié
+                return 1
+            if dow == 4 and (d in fr_holidays or (date - pd.Timedelta(days=1)).date() in fr_holidays):  # Vendredi férié ou après jeudi férié
+                return 1
+            if dow == 5 and ((date - pd.Timedelta(days=1)).date() in fr_holidays or (date - pd.Timedelta(days=2)).date() in fr_holidays):
+                return 1
+            if dow == 6 and ((date - pd.Timedelta(days=2)).date() in fr_holidays or (date - pd.Timedelta(days=3)).date() in fr_holidays):
+                return 1
+            
+            # Configuration 2: Samedi-Dimanche-Lundi-Mardi (fériés lundi OU mardi)
+            if dow == 1 and d in fr_holidays:  # Mardi férié
+                return 1
+            if dow == 0 and (d in fr_holidays or (date + pd.Timedelta(days=1)).date() in fr_holidays):  # Lundi férié ou avant mardi férié
+                return 1
+            if dow == 6 and ((date + pd.Timedelta(days=1)).date() in fr_holidays or (date + pd.Timedelta(days=2)).date() in fr_holidays):
+                return 1
+            if dow == 5 and ((date + pd.Timedelta(days=2)).date() in fr_holidays or (date + pd.Timedelta(days=3)).date() in fr_holidays):
+                return 1
+            
+            return 0
+        
+        df["is_long_weekend_3j"] = df["stay_date"].apply(is_long_weekend_3days)
+        df["is_long_weekend_4j"] = df["stay_date"].apply(is_long_weekend_4days)
+        
+        # Afficher les statistiques des features jours fériés
+        logger.info(f"Features jours fériés et vacances ajoutées. Shape: {df.shape}")
+        logger.info(f"   - Jours fériés: {df['is_holiday_fr'].sum()} ({df['is_holiday_fr'].mean()*100:.2f}%)")
+        logger.info(f"   - Jours de pont: {df['is_bridge_day'].sum()} ({df['is_bridge_day'].mean()*100:.2f}%)")
+        logger.info(f"   - Distance au férié: min={df['days_to_holiday'].min()}, max={df['days_to_holiday'].max()}, moyenne={df['days_to_holiday'].mean():.1f}")
+        logger.info(f"   - Vacances scolaires: {df['is_vacances_scolaires'].sum()} ({df['is_vacances_scolaires'].mean()*100:.2f}%)")
+        logger.info(f"   - Weekends 3j: {df['is_long_weekend_3j'].sum()} ({df['is_long_weekend_3j'].mean()*100:.2f}%)")
+        logger.info(f"   - Weekends 4j: {df['is_long_weekend_4j'].sum()} ({df['is_long_weekend_4j'].mean()*100:.2f}%)")
         
         return df
     
@@ -326,6 +800,26 @@ class XGBoostOccupancyPredictor:
         
         horizon = self.config['prediction_horizon']
         
+        logger.info("--------------------------------")
+        logger.info(f"Horizon: {horizon}")
+        logger.info("--------------------------------")
+        logger.info(f"df.columns: {df.columns}")
+        
+        # Recalculer nb_observations en fonction de l'horizon
+        # nb_observations doit refléter le nombre de points réellement utilisables
+        if "nb_observations" in df.columns:
+            # Pour chaque ligne, compter combien de valeurs TO sont disponibles de J-60 à J-horizon
+            to_cols_available = [f"J-{i}" for i in range(60, horizon - 1, -1)]
+            to_cols_available = [c for c in to_cols_available if c in df.columns]
+            
+            # Compter les valeurs non-NaN pour chaque ligne
+            df["nb_observations"] = df[to_cols_available].notna().sum(axis=1)
+            
+            logger.info(f"nb_observations recalculé pour horizon={horizon}")
+            logger.info(f"   Minimum: {df['nb_observations'].min()}")
+            logger.info(f"   Maximum: {df['nb_observations'].max()}")
+            logger.info(f"   Moyenne: {df['nb_observations'].mean():.1f}")
+        
         # Colonnes de TO utilisées comme features : J-60 -> J-(HORIZON+1)
         to_feature_cols = [f"J-{i}" for i in range(60, horizon, -1)]
         to_feature_cols = [c for c in to_feature_cols if c in df.columns]
@@ -336,16 +830,52 @@ class XGBoostOccupancyPredictor:
             "pm_change_ratio", "pm_last_jump", "pm_trend_changes"
         ]
         
+        # Features Ant (Anticipation) compressées
+        ant_feature_cols = []
+        for suffix in ["slope", "volatility", "diff_sum", "change_ratio", "last_jump", "trend_changes"]:
+            col = f"ant_{suffix}"
+            if col in df.columns:
+                ant_feature_cols.append(col)
+        
+        # Features Ds (Durée de séjour) compressées
+        ds_feature_cols = []
+        for suffix in ["slope", "volatility", "diff_sum", "change_ratio", "last_jump", "trend_changes"]:
+            col = f"ds_{suffix}"
+            if col in df.columns:
+                ds_feature_cols.append(col)
+        
+        # Features prix concurrents (médian uniquement)
+        comp_feature_cols = []
+        for suffix in ["slope", "volatility", "diff_sum", "change_ratio", "last_jump", "trend_changes"]:
+            col = f"comp_{suffix}"
+            if col in df.columns:
+                comp_feature_cols.append(col)
+        
+        # Features Gap et Elasticity (PM vs Concurrents)
+        gap_elasticity_cols = []
+        for col in ["gap_last", "gap_slope", "elasticity_last", "elasticity_slope"]:
+            if col in df.columns:
+                gap_elasticity_cols.append(col)
+        
         # Autres features
         other_feature_cols = []
-        for col in ["nb_observations", "cluster", "month", "dayofweek"]:
+        for col in ["nb_observations", "cluster", "month", "dayofweek", "ToF1",
+                    "is_holiday_fr", "is_bridge_day", "days_to_holiday",
+                    "is_vacances_scolaires", "is_long_weekend_3j", "is_long_weekend_4j"]:
             if col in df.columns:
                 other_feature_cols.append(col)
         
         # Construction de la liste finale de features
-        self.feature_cols = to_feature_cols + pm_feature_cols + other_feature_cols
+        self.feature_cols = to_feature_cols + pm_feature_cols + ant_feature_cols + ds_feature_cols + comp_feature_cols + gap_elasticity_cols + other_feature_cols
         
-        logger.info(f"Nombre de features: {len(self.feature_cols)}")
+        logger.info(f"Nombre total de features: {len(self.feature_cols)}")
+        logger.info(f"   - TO historiques: {len(to_feature_cols)}")
+        logger.info(f"   - Features PM: {len(pm_feature_cols)}")
+        logger.info(f"   - Features Ant (anticipation): {len(ant_feature_cols)}")
+        logger.info(f"   - Features Ds (durée séjour): {len(ds_feature_cols)}")
+        logger.info(f"   - Features concurrents: {len(comp_feature_cols)}")
+        logger.info(f"   - Features Gap/Elasticity: {len(gap_elasticity_cols)}")
+        logger.info(f"   - Autres features: {len(other_feature_cols)}")
         
         # Cible = TO final J-0
         if "J-0" not in df.columns:
@@ -359,9 +889,162 @@ class XGBoostOccupancyPredictor:
         X = X[mask_valid]
         y = y[mask_valid]
         
+        # Sauvegarder les données d'entraînement avec stay_date et hotCode
+        df_filtered = df[mask_valid].copy()
+        self._save_training_data(df_filtered, self.feature_cols)
+        
         logger.info(f"X shape: {X.shape}, y shape: {y.shape}")
         
         return X, y
+    
+    def _save_training_data(self, df_complete: pd.DataFrame, feature_cols: List[str], output_dir: str = "results/D09"):
+        """
+        Sauvegarde le DataFrame d'entraînement filtré avant normalisation.
+        
+        Args:
+            df_complete: DataFrame complet brut (toutes les colonnes)
+            feature_cols: Liste des colonnes features à sauvegarder
+            output_dir: Répertoire de sortie
+        """
+        try:
+            # Créer le répertoire s'il n'existe pas
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Sélectionner les colonnes à sauvegarder
+            cols_to_save = []
+            
+            # Ajouter les colonnes d'identification si elles existent
+            if "stay_date" in df_complete.columns:
+                cols_to_save.append("stay_date")
+            if "hotCode" in df_complete.columns:
+                cols_to_save.append("hotCode")
+            
+            # Ajouter toutes les features
+            cols_to_save.extend(feature_cols)
+            
+            # Ajouter le target
+            if "J-0" in df_complete.columns:
+                cols_to_save.append("J-0")
+            
+            # Filtrer le DataFrame pour ne garder que les colonnes pertinentes
+            df_to_save = df_complete[cols_to_save].copy()
+            
+            # Chemin de sauvegarde
+            output_path = os.path.join(output_dir, "training_data_before_scaling.csv")
+            
+            # Sauvegarder le DataFrame filtré en CSV
+            df_to_save.to_csv(output_path, index=False, sep=';', encoding='utf-8')
+            
+            logger.info(f"💾 Données d'entraînement sauvegardées: {output_path}")
+            logger.info(f"   Shape: {df_to_save.shape}")
+            logger.info(f"   Colonnes: stay_date, hotCode, {len(feature_cols)} features, J-0")
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Erreur lors de la sauvegarde des données d'entraînement: {e}")
+    
+    def hyperparameter_search(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
+        """
+        Recherche les meilleurs hyperparamètres pour le modèle XGBoost avec RandomizedSearchCV.
+        
+        Args:
+            X: Features
+            y: Target
+            
+        Returns:
+            Dictionnaire avec les meilleurs paramètres trouvés
+        """
+        logger.info("=" * 80)
+        logger.info("RECHERCHE D'HYPERPARAMÈTRES (RANDOMIZED SEARCH)")
+        logger.info("=" * 80)
+        
+        # Normalisation des features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Split train/validation
+        test_size = self.config.get('test_size', 0.2)
+        random_state = self.config.get('random_state', 42)
+        
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_scaled, y, 
+            test_size=test_size, 
+            random_state=random_state
+        )
+        
+        logger.info(f"Train: {X_train.shape}, Validation: {X_val.shape}")
+        
+        # Grille de paramètres à tester
+        param_distributions = {
+            'n_estimators': [300, 500, 600, 800],
+            'learning_rate': [0.01, 0.03, 0.05, 0.08],
+            'max_depth': [5, 6, 7, 8, 9],
+            'subsample': [0.8, 0.85, 0.9, 0.95],
+            'colsample_bytree': [0.8, 0.85, 0.9, 0.95],
+            'min_child_weight': [1, 2, 3],
+            'reg_lambda': [0.5, 1.0, 1.5, 2.0],
+            'reg_alpha': [0, 0.1, 0.5, 1.0]
+        }
+        
+        # Modèle de base
+        base_model = xgb.XGBRegressor(
+            random_state=random_state,
+            n_jobs=-1
+        )
+        
+        # Configuration de la recherche
+        n_iter = self.config.get('hyperparam_search', {}).get('n_iter', 30)
+        cv_folds = self.config.get('hyperparam_search', {}).get('cv_folds', 3)
+        
+        logger.info(f"Configuration de la recherche:")
+        logger.info(f"   - Nombre d'itérations: {n_iter}")
+        logger.info(f"   - Cross-validation: {cv_folds} folds")
+        logger.info(f"   - Nombre total d'entraînements: {n_iter * cv_folds}")
+        logger.info(f"   - Métrique: neg_mean_absolute_error")
+        
+        # Recherche randomisée
+        random_search = RandomizedSearchCV(
+            estimator=base_model,
+            param_distributions=param_distributions,
+            n_iter=n_iter,
+            cv=cv_folds,
+            scoring='neg_mean_absolute_error',
+            n_jobs=-1,
+            random_state=random_state,
+            verbose=1
+        )
+        
+        logger.info("\nDémarrage de la recherche d'hyperparamètres...")
+        random_search.fit(X_train, y_train)
+        
+        # Meilleurs paramètres
+        best_params = random_search.best_params_
+        best_score = -random_search.best_score_  # Convertir neg_MAE en MAE
+        
+        logger.info("=" * 80)
+        logger.info("RÉSULTATS DE LA RECHERCHE")
+        logger.info("=" * 80)
+        logger.info(f"Meilleur score (MAE sur CV): {best_score:.4f}")
+        logger.info(f"Meilleurs paramètres trouvés:")
+        for param, value in best_params.items():
+            logger.info(f"   - {param}: {value}")
+        
+        # Évaluation sur le set de validation
+        best_model = random_search.best_estimator_
+        y_pred_val = best_model.predict(X_val)
+        val_mae = mean_absolute_error(y_val, y_pred_val)
+        val_r2 = r2_score(y_val, y_pred_val)
+        
+        logger.info(f"\nPerformances sur validation:")
+        logger.info(f"   - MAE: {val_mae:.4f}")
+        logger.info(f"   - R²: {val_r2:.4f}")
+        logger.info("=" * 80)
+        
+        return {
+            'best_params': best_params,
+            'best_score': best_score,
+            'val_mae': val_mae,
+            'val_r2': val_r2,
+            'cv_results': random_search.cv_results_
+        }
     
     def train_model(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
         """
@@ -484,7 +1167,7 @@ class XGBoostOccupancyPredictor:
         ax.grid(True)
         
         if save_plots:
-            results_dir = "results"
+            results_dir = "results/D09"
             os.makedirs(results_dir, exist_ok=True)
             plot_path = os.path.join(results_dir, "xgb_scatter_plot.png")
             plt.savefig(plot_path)
@@ -502,7 +1185,7 @@ class XGBoostOccupancyPredictor:
         ax.set_xlabel("Importance")
         
         if save_plots:
-            results_dir = "results"
+            results_dir = "results/D09"
             os.makedirs(results_dir, exist_ok=True)
             plot_path = os.path.join(results_dir, "xgb_feature_importance.png")
             plt.savefig(plot_path, bbox_inches='tight')
@@ -510,7 +1193,7 @@ class XGBoostOccupancyPredictor:
         
         plt.close()
     
-    def save_model_locally(self, model_dir: str = "results/models"):
+    def save_model_locally(self, model_dir: str = "results/D09/models"):
         """
         Sauvegarde le modèle et le scaler localement.
         
@@ -600,8 +1283,9 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
         Dictionnaire de configuration
     """
     default_config = {
-        'clustering_results_path': '../results/clustering_results.csv',
-        'indicateurs_path': '../data/Indicateurs.csv',
+        'clustering_results_path': '../results/D09/clustering_results.csv',
+        'indicateurs_path': '../data/D09/Indicateurs.csv',
+        'rateShopper_path': '../data/D09/rateShopper.csv',
         'prediction_horizon': 7,
         'test_size': 0.2,
         'random_state': 42,
@@ -618,7 +1302,11 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
         },
         'azure_container': 'prediction-demande',
         'save_to_azure': True,
-        'model_dir': 'results/models'
+        'model_dir': 'results/D09/models',
+        'hyperparam_search': {
+            'n_iter': 30,
+            'cv_folds': 3
+        }
     }
     
     if YAML_AVAILABLE and Path(config_path).exists():
@@ -630,6 +1318,7 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
             config = {
                 'clustering_results_path': yaml_config['data']['clustering_results'],
                 'indicateurs_path': yaml_config['data']['indicateurs'],
+                'rateShopper_path': yaml_config['data'].get('rateShopper', '../data/D09/rateShopper.csv'),
                 'prediction_horizon': yaml_config['prediction']['horizon'],
                 'test_size': yaml_config['training']['test_size'],
                 'random_state': yaml_config['training']['random_state'],
@@ -639,7 +1328,8 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
                 },
                 'azure_container': yaml_config['azure']['container_name'],
                 'save_to_azure': yaml_config['azure']['save_to_blob'],
-                'model_dir': yaml_config['output']['model_dir']
+                'model_dir': yaml_config['output']['model_dir'],
+                'hyperparam_search': yaml_config.get('hyperparam_search', {'n_iter': 30, 'cv_folds': 3})
             }
             logger.info(f"✅ Configuration chargée depuis {config_path}")
             return config
@@ -658,6 +1348,9 @@ def main():
     """
     Fonction principale pour l'exécution du pipeline d'entraînement.
     """
+    os.chdir("C:\\github\\ml-demande\\demande\\predictTo")
+    print("Répertoire courant :", os.getcwd())
+
     # Parser les arguments de ligne de commande
     parser = argparse.ArgumentParser(
         description="Entraînement du modèle XGBoost pour la prédiction du TO"
@@ -665,13 +1358,18 @@ def main():
     parser.add_argument(
         '--config', 
         type=str, 
-        default='config_xgboost.yaml',
+        default='config_predictTo.yaml',
         help='Chemin du fichier de configuration YAML'
     )
     parser.add_argument(
         '--no-azure', 
         action='store_true',
         help='Désactiver la sauvegarde Azure'
+    )
+    parser.add_argument(
+        '--search-hyperparams',
+        action='store_true',
+        help='Activer la recherche d\'hyperparamètres avant l\'entraînement'
     )
     args = parser.parse_args()
     
@@ -709,17 +1407,28 @@ def main():
         # 3. Créer les features et target
         X, y = predictor.create_features_target(df)
         
-        # 4. Entraîner le modèle
+        # 4. Recherche d'hyperparamètres (optionnel)
+        if args.search_hyperparams:
+            hyperparam_results = predictor.hyperparameter_search(X, y)
+            
+            # Mettre à jour la config avec les meilleurs paramètres
+            logger.info("\n🔧 Mise à jour de la configuration avec les meilleurs paramètres...")
+            config['model_params'].update(hyperparam_results['best_params'])
+            config['model_params']['random_state'] = config.get('random_state', 42)
+            config['model_params']['n_jobs'] = -1
+            predictor.config = config
+        
+        # 5. Entraîner le modèle (avec les meilleurs paramètres si recherche effectuée)
         results = predictor.train_model(X, y)
         
-        # 5. Évaluer le modèle
+        # 6. Évaluer le modèle
         predictor.evaluate_model(save_plots=True)
         
-        # 6. Sauvegarder localement
+        # 7. Sauvegarder localement
         model_dir = config.get('model_dir', 'results/models')
         local_paths = list(predictor.save_model_locally(model_dir))
         
-        # 7. Sauvegarder dans Azure (si activé)
+        # 8. Sauvegarder dans Azure (si activé)
         if config.get('save_to_azure', False):
             container_name = config.get('azure_container', 'prediction-demande')
             predictor.save_to_azure_blob(local_paths, container_name)
