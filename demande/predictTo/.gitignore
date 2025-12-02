@@ -1,0 +1,39 @@
+# Logs d'erreur générés automatiquement
+error_logs/
+
+# Logs d'entraînement
+*.log
+
+# Résultats d'entraînement
+results/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environnements virtuels
+venv/
+env/
+.venv/
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*~
+
+# Fichiers de configuration locaux
+.env
+config_local.yaml
+
+# Modèles sauvegardés localement (avant upload Azure)
+models/
+*.joblib
+*.pkl
+*.pickle
+
+# Données de test
+test_data/
+debug_*.csv
+sample_*.csv
+

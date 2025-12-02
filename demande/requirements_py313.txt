@@ -1,0 +1,291 @@
+# =============================================================================
+# Requirements.txt pour Python 3.13.x - Machine Learning Pipeline
+# =============================================================================
+# 
+# Installation:
+#   pip install -r requirements_py313.txt
+#
+# Prérequis:
+#   Python 3.13.0 ou supérieur
+#
+# Installation avec GPU (optionnel):
+#   pip install tensorflow[and-cuda]>=2.15.0
+#   pip install cuml-cu12 --extra-index-url=https://pypi.nvidia.com
+#
+# =============================================================================
+
+# ============================================
+# Core Data Science Libraries
+# ============================================
+numpy>=1.26.0,<2.3.0              # Python 3.13 nécessite NumPy >= 1.26
+pandas>=2.1.0,<3.0.0              # Python 3.13 compatible à partir de 2.1.0
+scipy>=1.11.0,<1.15.0             # Python 3.13 nécessite SciPy >= 1.11
+scikit-learn>=1.3.2,<1.6.0        # Python 3.13 compatible à partir de 1.3.2
+
+# ============================================
+# Machine Learning Frameworks
+# ============================================
+xgboost>=2.0.3,<2.2.0             # Python 3.13 compatible à partir de 2.0.3
+lightgbm>=4.1.0,<5.0.0            # Python 3.13 compatible à partir de 4.1.0
+imbalanced-learn>=0.12.0,<0.13.0 # Python 3.13 compatible
+joblib>=1.3.2,<1.5.0              # Python 3.13 compatible
+
+# ============================================
+# Deep Learning (Réseaux de Neurones)
+# ============================================
+tensorflow>=2.15.0,<2.18.0        # Python 3.13 nécessite TensorFlow >= 2.15
+scikeras>=0.13.0,<1.0.0           # Compatible scikit-learn 1.3+ et Python 3.13
+optuna>=3.5.0,<5.0.0              # Optimisation hyperparamètres - Python 3.13 compatible
+optuna-integration>=3.5.0,<5.0.0  # Intégrations Optuna (TensorFlow/Keras pruning)
+
+# ============================================
+# Data Visualization
+# ============================================
+matplotlib>=3.8.0,<3.12.0         # Python 3.13 nécessite >= 3.8.0
+seaborn>=0.13.0,<0.14.0           # Python 3.13 compatible
+altair>=5.2.0,<6.0.0
+contourpy>=1.2.0,<1.4.0
+cycler>=0.12.0,<0.13.0
+fonttools>=4.47.0,<5.0.0
+kiwisolver>=1.4.5,<1.5.0
+pillow>=10.2.0,<12.0.0
+pyparsing>=3.1.1,<3.3.0
+
+# ============================================
+# Web Framework & API
+# ============================================
+fastapi>=0.109.0,<0.117.0
+uvicorn[standard]>=0.27.0,<0.36.0
+starlette>=0.36.0,<0.49.0
+pydantic>=2.6.0,<2.12.0
+pydantic-settings>=2.2.0,<2.11.0
+pydantic_core>=2.16.0,<2.34.0
+python-multipart>=0.0.9,<0.1.0
+
+# ============================================
+# Streamlit
+# ============================================
+streamlit>=1.31.0,<1.51.0
+pydeck>=0.8.0,<1.0.0
+tornado>=6.4.0,<6.6.0
+watchdog>=4.0.0,<6.1.0
+
+# ============================================
+# Azure Integration
+# ============================================
+azure-storage-blob>=12.19.0,<12.27.0
+azure-identity>=1.15.0,<1.26.0
+azure-core>=1.30.0,<1.36.0
+msal>=1.27.0,<1.34.0
+msal-extensions>=1.1.0,<1.4.0
+
+# ============================================
+# HTTP & Networking
+# ============================================
+httpx>=0.27.0,<0.29.0
+httpcore>=1.0.0,<1.1.0
+h11>=0.14.0,<0.17.0
+requests>=2.31.0,<3.0.0
+urllib3>=2.2.0,<3.0.0
+certifi>=2024.2.2
+idna>=3.6,<4.0
+charset-normalizer>=3.3.0,<3.5.0
+
+# ============================================
+# Logging & Monitoring
+# ============================================
+structlog>=24.1.0,<26.0.0
+psutil>=5.9.8,<8.0.0
+
+# ============================================
+# Environment & Configuration
+# ============================================
+python-dotenv>=1.0.1,<2.0.0
+
+# ============================================
+# Utilities & Helpers
+# ============================================
+click>=8.1.7,<9.0.0
+Jinja2>=3.1.3,<4.0.0
+MarkupSafe>=2.1.5,<3.1.0
+python-dateutil>=2.9.0
+pytz>=2024.1
+tzdata>=2024.1
+six>=1.16.0,<2.0.0
+packaging>=24.0,<26.0
+toml>=0.10.2,<0.11.0
+
+# ============================================
+# Data Processing
+# ============================================
+pyarrow>=15.0.0,<22.0.0
+narwhals>=0.9.0,<3.0.0
+
+# ============================================
+# Validation & Schema
+# ============================================
+jsonschema>=4.21.0,<4.26.0
+jsonschema-specifications>=2023.12.1,<2026.0.0
+referencing>=0.33.0,<0.37.0
+annotated-types>=0.6.0,<0.8.0
+rpds-py>=0.18.0,<0.28.0
+
+# ============================================
+# Security & Cryptography
+# ============================================
+cryptography>=42.0.0,<46.0.0
+cffi>=1.16.0,<2.1.0
+pycparser>=2.21,<2.24
+PyJWT>=2.8.0,<3.0.0
+
+# ============================================
+# Git & Version Control
+# ============================================
+GitPython>=3.1.41,<3.2.0
+gitdb>=4.0.11,<5.0.0
+smmap>=5.0.1,<6.0.0
+
+# ============================================
+# Async & Concurrency
+# ============================================
+anyio>=4.2.0,<5.0.0
+sniffio>=1.3.0,<2.0.0
+tenacity>=8.2.3,<10.0.0
+
+# ============================================
+# Other Dependencies
+# ============================================
+attrs>=23.2.0,<26.0.0
+blinker>=1.7.0,<2.0.0
+cachetools>=5.3.2,<7.0.0
+colorama>=0.4.6,<0.5.0
+isodate>=0.6.1,<0.8.0
+threadpoolctl>=3.2.0,<4.0.0
+typing-inspection>=0.1.0,<0.5.0
+typing_extensions>=4.9.0,<5.0.0
+
+# =============================================================================
+# NOTES IMPORTANTES POUR PYTHON 3.13
+# =============================================================================
+#
+# 1. Compatibilité Python 3.13:
+#    Python 3.13 est sorti en octobre 2024. Certains packages nécessitent
+#    des versions minimales spécifiques:
+#    - NumPy >= 1.26.0 (obligatoire)
+#    - pandas >= 2.1.0 (obligatoire)
+#    - scikit-learn >= 1.3.2 (obligatoire)
+#    - TensorFlow >= 2.15.0 (obligatoire)
+#    - matplotlib >= 3.8.0 (obligatoire)
+#
+# 2. TensorFlow GPU sur Python 3.13:
+#    Pour utiliser TensorFlow avec GPU sur Python 3.13:
+#    pip install tensorflow[and-cuda]>=2.15.0
+#    
+#    Prérequis:
+#    - CUDA Toolkit 12.x (pas 11.x)
+#    - cuDNN 8.9+
+#    - Carte NVIDIA avec Compute Capability 3.5+
+#
+# 3. XGBoost GPU:
+#    XGBoost 2.0.3+ détecte automatiquement CUDA 12.x.
+#    Assurez-vous d'avoir CUDA Toolkit 12.x installé.
+#
+# 4. Optuna pour Optimisation:
+#    Optuna est maintenant inclus par défaut pour l'optimisation
+#    des hyperparamètres des réseaux de neurones.
+#
+# 5. cuML (RAPIDS) sur Python 3.13:
+#    Pour utiliser cuML avec Python 3.13:
+#    pip install cuml-cu12 --extra-index-url=https://pypi.nvidia.com
+#    
+#    Note: Utilisez cuml-cu12 (CUDA 12.x) et non cuml-cu11
+#
+# 6. Variables d'environnement Azure:
+#    Créez un fichier .env avec:
+#    AZURE_STORAGE_CONNECTION_STRING=votre_connection_string
+#    AZURE_CONTAINER_NAME=ml-models
+#
+# 7. Installation recommandée:
+#    # Créer environnement virtuel
+#    python -m venv venv_py313
+#    
+#    # Activer (Windows)
+#    venv_py313\Scripts\activate
+#    
+#    # Activer (Linux/Mac)
+#    source venv_py313/bin/activate
+#    
+#    # Installer dépendances
+#    pip install --upgrade pip
+#    pip install -r requirements_py313.txt
+#
+# 8. Test de compatibilité:
+#    Après installation, testez avec:
+#    python test_neural_networks.py
+#
+# 9. Problèmes connus Python 3.13:
+#    - Certains anciens packages peuvent ne pas être compatibles
+#    - Si erreur, vérifier que vous utilisez les versions minimales indiquées
+#    - TensorFlow < 2.15 ne fonctionne PAS avec Python 3.13
+#
+# 10. Performance Python 3.13:
+#     Python 3.13 apporte des améliorations de performance:
+#     - JIT compiler expérimental
+#     - Meilleure gestion mémoire
+#     - Performances accrues sur réseaux de neurones
+#
+# =============================================================================
+# MIGRATION DEPUIS PYTHON 3.10
+# =============================================================================
+#
+# Si vous migrez depuis Python 3.10 (requirements_py310.txt):
+#
+# 1. Créer nouvel environnement Python 3.13:
+#    python3.13 -m venv venv_py313
+#
+# 2. Activer et installer:
+#    venv_py313\Scripts\activate  # Windows
+#    pip install -r requirements_py313.txt
+#
+# 3. Tester les imports:
+#    python -c "import tensorflow as tf; print(f'TensorFlow: {tf.__version__}')"
+#    python -c "import numpy as np; print(f'NumPy: {np.__version__}')"
+#    python -c "import sklearn; print(f'scikit-learn: {sklearn.__version__}')"
+#
+# 4. Tester le pipeline complet:
+#    python test_neural_networks.py
+#
+# 5. Différences principales vs Python 3.10:
+#    - NumPy: 1.24.0 → 1.26.0 (minimum)
+#    - pandas: 2.0.0 → 2.1.0 (minimum)
+#    - TensorFlow: 2.13.0 → 2.15.0 (minimum)
+#    - scikit-learn: 1.3.0 → 1.3.2 (minimum)
+#    - xgboost: 2.0.0 → 2.0.3 (minimum)
+#    - CUDA: 11.x → 12.x (pour GPU)
+#
+# =============================================================================
+# DÉPANNAGE
+# =============================================================================
+#
+# Erreur: "No module named '_ctypes'"
+# Solution: Réinstaller Python 3.13 avec support libffi
+#
+# Erreur: "numpy.dtype size changed"
+# Solution: pip install --upgrade --force-reinstall numpy
+#
+# Erreur: "TensorFlow not compatible with Python 3.13"
+# Solution: pip install --upgrade tensorflow>=2.15.0
+#
+# Erreur: Package XXX not found
+# Solution: Certains packages peuvent ne pas encore supporter Python 3.13
+#           Utilisez Python 3.10 ou 3.11 avec requirements_py310.txt
+#
+# =============================================================================
+# VERSION ET DATE
+# =============================================================================
+# Version: 1.0.0
+# Date: 22 novembre 2025
+# Python: 3.13.x
+# Testé avec: Python 3.13.0
+# =============================================================================
+

@@ -2,14 +2,17 @@
 # =========================================================
 
 # Chemins des données (relatifs au dossier predictTo/)
+# Note : {hotCode} sera remplacé automatiquement par le code de l'hôtel (ex: D09, 6N8, 0BT)
 data:
-  clustering_results: "../results/D09/clustering_results.csv"
-  indicateurs: "../data/D09/Indicateurs.csv"
-  rateShopper: "../data/D09/rateShopper.csv"  # Prix des concurrents
+  clustering_base_dir: "../cluster/results"  # Dossier de base pour les résultats de clustering (par hôtel)
+  clustering_results: "../cluster/results/{hotCode}/clustering_results.csv"  # Chemin avec template (mode global)
+  indicateurs: "../data/{hotCode}/Indicateurs.csv"
+  rateShopper: "../data/{hotCode}/rateShopper.csv"  # Prix des concurrents
 
 # Paramètres de prédiction
 prediction:
-  horizon: 45  # Prédire TO à J+7
+  horizon: 7  # Horizon de prédiction (0 à 59 jours)
+  # Note : Maximum 59 car les données vont jusqu'à J-60
 
 # Split des données
 training:
@@ -29,12 +32,13 @@ model:
 
 # Configuration Azure Blob Storage
 azure:
-  container_name: "prediction-demande"
+  container_name: "ml-models"  # Container Azure pour les modèles
   save_to_blob: true  # Activer/désactiver la sauvegarde Azure
+  # Les fichiers seront sauvegardés dans: ml-models/predictTo/{hotCode}/J-{horizon}/
 
 # Options de sortie
 output:
-  model_dir: "results/D09/models"
+  base_dir: "results"  # Répertoire de base (sera complété par {hotCode}/J-horizon/)
   save_plots: true
   log_file: "predictTo_training.log"
 
@@ -49,4 +53,28 @@ hyperparam_search:
 # - Pour activer la recherche d'hyperparamètres: python predictTo_train_model.py --search-hyperparams
 # - Randomized Search teste n_iter combinaisons aléatoires (plus rapide que Grid Search)
 # - Le random_state garantit des résultats reproductibles
+# 
+# Structure de sortie (locale ET Azure):
+# - Les fichiers seront organisés dans: {base_dir}/{hotCode}/J-{horizon}/
+# - Exemples LOCAUX:
+#   * results/D09/ALL/J-7/models/         (modèle global pour tous les hôtels, horizon J-7)
+#   * results/D09/D09/J-14/models/        (modèle pour hôtel D09, horizon J-14)
+# - Exemples AZURE (container ml-models):
+#   * predictTo/ALL/J-7/models/           (modèle global, horizon J-7)
+#   * predictTo/D09/J-14/models/          (modèle pour hôtel D09, horizon J-14)
+# - Utilisez --hotel et --horizon pour personnaliser:
+#   * python predictTo_train_model.py --horizon 7
+#   * python predictTo_train_model.py --hotel D09 --horizon 14
+# 
+# Chargement des données de clustering:
+# - Avec --hotel: charge depuis {clustering_base_dir}/{hotCode}/clustering_results.csv
+#   Exemple: ../cluster/results/D09/clustering_results.csv
+# - Sans --hotel: utilise le chemin data.clustering_results (mode global)
+# 
+# IMPORTANT: Le placeholder {hotCode} dans les chemins est automatiquement remplacé
+# par le code de l'hôtel spécifié avec --hotel.
+# Exemples:
+#   --hotel D09 → ../data/D09/Indicateurs.csv
+#   --hotel 6N8 → ../data/6N8/Indicateurs.csv
+#   --hotel 0BT → ../data/0BT/Indicateurs.csv
 

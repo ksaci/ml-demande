@@ -115,25 +115,77 @@ class XGBoostOccupancyPredictor:
     Classe principale pour l'entraînement du modèle XGBoost de prédiction du TO.
     """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], hotel_code: str = None):
         """
         Initialise le prédicteur avec la configuration.
         
         Args:
             config: Dictionnaire de configuration contenant les paramètres du modèle
+            hotel_code: Code de l'hôtel (optionnel, pour entraînement par hôtel)
         """
         self.config = config
+        self.hotel_code = hotel_code
         self.model = None
         self.scaler = StandardScaler()
         self.feature_cols = []
         self.results = {}
         
+        # Remplacer {hotel} dans les chemins de configuration si hotel_code est fourni
+        if hotel_code:
+            self._replace_hotel_placeholder()
+        
         logger.info("Initialisation du XGBoostOccupancyPredictor")
-        logger.info(f"Configuration: {config}")
+        if hotel_code:
+            logger.info(f"Mode: Entraînement pour l'hôtel {hotel_code}")
+        else:
+            logger.info(f"Mode: Entraînement global (tous les hôtels)")
+        logger.info(f"Configuration après substitution: {config}")
+    
+    def _replace_hotel_placeholder(self):
+        """
+        Remplace le placeholder {hotCode} dans les chemins de configuration par le code d'hôtel réel.
+        """
+        if not self.hotel_code:
+            return
+        
+        # Chemins à remplacer
+        paths_to_replace = [
+            'clustering_results_path',
+            'indicateurs_path',
+            'rateShopper_path'
+        ]
+        
+        for path_key in paths_to_replace:
+            if path_key in self.config:
+                original_path = self.config[path_key]
+                if '{hotCode}' in original_path:
+                    new_path = original_path.replace('{hotCode}', self.hotel_code)
+                    self.config[path_key] = new_path
+                    logger.debug(f"Remplacement {path_key}: {original_path} → {new_path}")
+    
+    def _get_output_dir(self) -> str:
+        """
+        Construit le répertoire de sortie selon la structure hotel/horizon.
+        
+        Returns:
+            Chemin du répertoire de sortie (ex: results/D09/J-7 ou results/ALL/J-7)
+        """
+        base_dir = self.config.get('output_base_dir', 'results')
+        horizon = self.config.get('prediction_horizon', 7)
+        
+        # Si un hotel_code est spécifié, l'utiliser, sinon "ALL"
+        hotel_folder = self.hotel_code if self.hotel_code else "ALL"
+        
+        # Construire le chemin : base_dir/hotel/J-horizon
+        output_dir = os.path.join(base_dir, hotel_folder, f"J-{horizon}")
+        
+        return output_dir
     
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Charge les données de clustering et les indicateurs.
+        Si un hotel_code est spécifié, charge depuis cluster/results/{hotel_code}/clustering_results.csv
+        Sinon, utilise le chemin de la configuration.
         
         Returns:
             Tuple contenant (clusters_df, indicateurs_df)
@@ -141,24 +193,32 @@ class XGBoostOccupancyPredictor:
         logger.info("Chargement des données...")
         
         try:
+            # Déterminer le chemin du fichier de clustering
+            if self.hotel_code:
+                # Construire le chemin dynamiquement depuis le dossier cluster/results/{hotel}/
+                clustering_base_dir = self.config.get('clustering_base_dir', '../cluster/results')
+                clustering_path = os.path.join(clustering_base_dir, self.hotel_code, 'clustering_results.csv')
+                logger.info(f"Chargement des clusters depuis: {clustering_path}")
+            else:
+                # Utiliser le chemin de la configuration (mode global)
+                clustering_path = self.config['clustering_results_path']
+                logger.info(f"Chargement des clusters depuis la config: {clustering_path}")
+            
             # Charger les résultats de clustering
-            clusters = pd.read_csv(
-                self.config['clustering_results_path'], 
-                sep=';'
-            )
-            logger.info(f"Clusters chargés: {clusters.shape}")
+            clusters = pd.read_csv(clustering_path, sep=';')
+            logger.info(f"✅ Clusters chargés: {clusters.shape}")
             
             # Charger les indicateurs
             indicateurs = pd.read_csv(
                 self.config['indicateurs_path'], 
                 sep=';'
             )
-            logger.info(f"Indicateurs chargés: {indicateurs.shape}")
+            logger.info(f"✅ Indicateurs chargés: {indicateurs.shape}")
             
             return clusters, indicateurs
             
         except Exception as e:
-            logger.error(f"Erreur lors du chargement des données: {e}")
+            logger.error(f"❌ Erreur lors du chargement des données: {e}")
             raise
     
     def load_competitor_prices(self, rateShopper_path: str) -> pd.DataFrame:
@@ -233,19 +293,22 @@ class XGBoostOccupancyPredictor:
         pivot.columns = [f"CompPrixMedian_J-{col}" for col in pivot.columns]
         pivot = pivot.reset_index()
         
-        # Récupérer les colonnes de séries temporelles (uniquement J-horizon à J-60)
+        # Récupérer les colonnes de séries temporelles (uniquement J-(horizon+1) à J-60)
         horizon = self.config['prediction_horizon']
         comp_cols_all = [c for c in pivot.columns if c.startswith("CompPrixMedian_J-")]
         comp_cols_available = []
         for col in comp_cols_all:
             # Extraire le numéro de J-X
             j_num = int(col.split("J-")[1])
-            if j_num >= horizon:  # Seulement les données de J-horizon et au-delà
+            if j_num > horizon:  # Seulement les données APRÈS J-horizon (pas de data leakage)
                 comp_cols_available.append(col)
         
         comp_cols_available = sorted(comp_cols_available, key=lambda x: int(x.split("J-")[1]))
         
-        logger.info(f"   Features concurrentes calculées sur J-{horizon} à J-60")
+        logger.info(f"   Features concurrentes calculées sur J-{horizon+1} à J-60")
+        
+        if len(comp_cols_available) == 0:
+            logger.warning(f"⚠️  Aucune colonne Comp disponible pour horizon={horizon}")
         
         # Convertir en numérique
         pivot[comp_cols_available] = pivot[comp_cols_available].apply(
@@ -533,19 +596,27 @@ class XGBoostOccupancyPredictor:
         # Calculer les features PM compressées (uniquement sur les données disponibles jusqu'à J-horizon)
         horizon = self.config['prediction_horizon']
         
-        # Filtrer les colonnes PM : de J-horizon à J-60 (pas de données futures !)
+        # Filtrer les colonnes PM : de J-(horizon+1) à J-60 (pas de données futures !)
+        # Pour horizon=0, on utilise J-1 à J-60 (pas J-0 car c'est le jour à prédire)
+        # Pour horizon=7, on utilise J-7 à J-60
         pm_cols_all = [c for c in df.columns if c.startswith("pm_J-")]
         pm_cols_available = []
         for col in pm_cols_all:
             # Extraire le numéro de J-X
             j_num = int(col.split("J-")[1])
-            if j_num >= horizon:  # Seulement les données de J-horizon et au-delà
+            if j_num > horizon:  # Seulement les données APRÈS J-horizon (pas de data leakage)
                 pm_cols_available.append(col)
         
         pm_cols_available = sorted(pm_cols_available, key=lambda x: int(x.split("J-")[1]))
         
-        logger.info(f"Calcul des features PM sur données J-{horizon} à J-60 (pas de data leakage)")
+        logger.info(f"Calcul des features PM sur données J-{horizon+1} à J-60 (pas de data leakage)")
         logger.info(f"   Colonnes PM utilisées: {len(pm_cols_available)}")
+        
+        # Vérifier qu'on a au moins quelques colonnes
+        if len(pm_cols_available) == 0:
+            logger.error(f"❌ Aucune colonne PM disponible pour horizon={horizon}")
+            logger.error(f"   Colonnes PM existantes: {[c for c in pm_cols_all[:5]]}")
+            raise ValueError(f"Pas de données PM disponibles pour horizon={horizon}")
         
         # Convertir en numérique
         df[pm_cols_available] = df[pm_cols_available].apply(
@@ -568,13 +639,16 @@ class XGBoostOccupancyPredictor:
         ant_cols_available = []
         for col in ant_cols_all:
             j_num = int(col.split("J-")[1])
-            if j_num >= horizon:
+            if j_num > horizon:  # Données APRÈS J-horizon (pas de data leakage)
                 ant_cols_available.append(col)
         
         ant_cols_available = sorted(ant_cols_available, key=lambda x: int(x.split("J-")[1]))
         
-        logger.info(f"Calcul des features Ant (anticipation) sur données J-{horizon} à J-60")
+        logger.info(f"Calcul des features Ant (anticipation) sur données J-{horizon+1} à J-60")
         logger.info(f"   Colonnes Ant utilisées: {len(ant_cols_available)}")
+        
+        if len(ant_cols_available) == 0:
+            logger.warning(f"⚠️  Aucune colonne Ant disponible pour horizon={horizon}")
         
         # Convertir en numérique
         df[ant_cols_available] = df[ant_cols_available].apply(
@@ -597,13 +671,16 @@ class XGBoostOccupancyPredictor:
         ds_cols_available = []
         for col in ds_cols_all:
             j_num = int(col.split("J-")[1])
-            if j_num >= horizon:
+            if j_num > horizon:  # Données APRÈS J-horizon (pas de data leakage)
                 ds_cols_available.append(col)
         
         ds_cols_available = sorted(ds_cols_available, key=lambda x: int(x.split("J-")[1]))
         
-        logger.info(f"Calcul des features Ds (durée séjour) sur données J-{horizon} à J-60")
+        logger.info(f"Calcul des features Ds (durée séjour) sur données J-{horizon+1} à J-60")
         logger.info(f"   Colonnes Ds utilisées: {len(ds_cols_available)}")
+        
+        if len(ds_cols_available) == 0:
+            logger.warning(f"⚠️  Aucune colonne Ds disponible pour horizon={horizon}")
         
         # Convertir en numérique
         df[ds_cols_available] = df[ds_cols_available].apply(
@@ -622,7 +699,7 @@ class XGBoostOccupancyPredictor:
         logger.info(f"Features Ds ajoutées: {df.shape}")
         
         # Ajouter les features des prix concurrents
-        rateShopper_path = self.config.get('rateShopper_path', '../data/D09/rateShopper.csv')
+        rateShopper_path = self.config.get('rateShopper_path', '../data/{hotCode}/rateShopper.csv')
         df_comp = self.load_competitor_prices(rateShopper_path)
         if df_comp is not None:
             df = self.prepare_competitor_features(df, df_comp)
@@ -786,7 +863,7 @@ class XGBoostOccupancyPredictor:
         
         return df
     
-    def create_features_target(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    def create_features_target(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
         """
         Crée les matrices X (features) et y (target).
         
@@ -794,7 +871,7 @@ class XGBoostOccupancyPredictor:
             df: DataFrame préparé
             
         Returns:
-            Tuple (X, y)
+            Tuple (X, y, df_filtered) où df_filtered contient toutes les colonnes incluant stay_date et hotCode
         """
         logger.info("Création des features et target...")
         
@@ -807,22 +884,36 @@ class XGBoostOccupancyPredictor:
         
         # Recalculer nb_observations en fonction de l'horizon
         # nb_observations doit refléter le nombre de points réellement utilisables
+        # Pour horizon=0: compter J-60 à J-1 (pas J-0 qui est la cible)
+        # Pour horizon=7: compter J-60 à J-8 (pas J-7 à J-0 qui sont trop proches/cibles)
         if "nb_observations" in df.columns:
-            # Pour chaque ligne, compter combien de valeurs TO sont disponibles de J-60 à J-horizon
-            to_cols_available = [f"J-{i}" for i in range(60, horizon - 1, -1)]
-            to_cols_available = [c for c in to_cols_available if c in df.columns]
+            # Pour chaque ligne, compter combien de valeurs TO sont disponibles de J-60 à J-(horizon+1)
+            to_cols_for_count = [f"J-{i}" for i in range(60, horizon, -1)]
+            to_cols_for_count = [c for c in to_cols_for_count if c in df.columns]
             
             # Compter les valeurs non-NaN pour chaque ligne
-            df["nb_observations"] = df[to_cols_available].notna().sum(axis=1)
+            if len(to_cols_for_count) > 0:
+                df["nb_observations"] = df[to_cols_for_count].notna().sum(axis=1)
+            else:
+                df["nb_observations"] = 0
             
             logger.info(f"nb_observations recalculé pour horizon={horizon}")
+            logger.info(f"   Colonnes TO comptées: J-60 à J-{horizon+1} ({len(to_cols_for_count)} colonnes)")
             logger.info(f"   Minimum: {df['nb_observations'].min()}")
             logger.info(f"   Maximum: {df['nb_observations'].max()}")
             logger.info(f"   Moyenne: {df['nb_observations'].mean():.1f}")
         
         # Colonnes de TO utilisées comme features : J-60 -> J-(HORIZON+1)
+        # Pour horizon=0: utiliser J-60 à J-1 (pas J-0)
+        # Pour horizon=7: utiliser J-60 à J-8 (pas J-7 à J-0)
         to_feature_cols = [f"J-{i}" for i in range(60, horizon, -1)]
         to_feature_cols = [c for c in to_feature_cols if c in df.columns]
+        
+        logger.info(f"Features TO historiques: J-60 à J-{horizon+1} ({len(to_feature_cols)} colonnes)")
+        
+        if len(to_feature_cols) == 0:
+            logger.error(f"❌ Aucune colonne TO disponible comme feature pour horizon={horizon}")
+            raise ValueError(f"Pas de colonnes TO disponibles pour horizon={horizon}")
         
         # Features PM compressées
         pm_feature_cols = [
@@ -895,9 +986,10 @@ class XGBoostOccupancyPredictor:
         
         logger.info(f"X shape: {X.shape}, y shape: {y.shape}")
         
-        return X, y
+        # Retourner aussi le DataFrame filtré pour la sauvegarde des prédictions de test
+        return X, y, df_filtered
     
-    def _save_training_data(self, df_complete: pd.DataFrame, feature_cols: List[str], output_dir: str = "results/D09"):
+    def _save_training_data(self, df_complete: pd.DataFrame, feature_cols: List[str], output_dir: str = None):
         """
         Sauvegarde le DataFrame d'entraînement filtré avant normalisation.
         
@@ -907,6 +999,10 @@ class XGBoostOccupancyPredictor:
             output_dir: Répertoire de sortie
         """
         try:
+            # Utiliser le répertoire de sortie de la config si non spécifié
+            if output_dir is None:
+                output_dir = self._get_output_dir()
+            
             # Créer le répertoire s'il n'existe pas
             os.makedirs(output_dir, exist_ok=True)
             
@@ -941,6 +1037,58 @@ class XGBoostOccupancyPredictor:
             
         except Exception as e:
             logger.warning(f"⚠️  Erreur lors de la sauvegarde des données d'entraînement: {e}")
+    
+    def _save_test_predictions(self, X_test: pd.DataFrame, y_test: pd.Series, y_pred: np.ndarray, df_test_info: pd.DataFrame = None, output_dir: str = None):
+        """
+        Sauvegarde le DataFrame de test avec les prédictions.
+        
+        Args:
+            X_test: Features de test (non normalisées)
+            y_test: Vraies valeurs de test
+            y_pred: Prédictions du modèle
+            df_test_info: DataFrame avec stay_date et hotCode (optionnel)
+            output_dir: Répertoire de sortie
+        """
+        try:
+            # Utiliser le répertoire de sortie de la config si non spécifié
+            if output_dir is None:
+                output_dir = self._get_output_dir()
+            
+            # Créer le répertoire s'il n'existe pas
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Créer le DataFrame de test
+            df_test = pd.DataFrame()
+            
+            # Ajouter stay_date et hotCode en premier si disponibles
+            if df_test_info is not None:
+                df_test['stay_date'] = df_test_info['stay_date'].values
+                df_test['hotCode'] = df_test_info['hotCode'].values
+            
+            # Ajouter toutes les features
+            for col in X_test.columns:
+                df_test[col] = X_test[col].values
+            
+            # Ajouter les prédictions et erreurs
+            df_test['y_test'] = y_test.values
+            df_test['y_pred'] = y_pred
+            df_test['error'] = df_test['y_pred'] - df_test['y_test']
+            df_test['abs_error'] = np.abs(df_test['error'])
+            
+            # Chemin de sauvegarde
+            output_path = os.path.join(output_dir, "test_predictions.csv")
+            
+            # Sauvegarder en CSV
+            df_test.to_csv(output_path, index=False, sep=';', encoding='utf-8')
+            
+            cols_info = "stay_date, hotCode, " if df_test_info is not None else ""
+            logger.info(f"💾 Prédictions de test sauvegardées: {output_path}")
+            logger.info(f"   Shape: {df_test.shape}")
+            logger.info(f"   Colonnes: {cols_info}{len(X_test.columns)} features + y_test + y_pred + error + abs_error")
+            logger.info(f"   MAE moyen: {df_test['abs_error'].mean():.4f}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Erreur lors de la sauvegarde des prédictions de test: {e}")
     
     def hyperparameter_search(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
         """
@@ -1046,33 +1194,35 @@ class XGBoostOccupancyPredictor:
             'cv_results': random_search.cv_results_
         }
     
-    def train_model(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
+    def train_model(self, X: pd.DataFrame, y: pd.Series, df_complete: pd.DataFrame = None) -> Dict[str, Any]:
         """
         Entraîne le modèle XGBoost.
         
         Args:
             X: Features
             y: Target
+            df_complete: DataFrame complet avec stay_date et hotCode (optionnel, pour sauvegarde test)
             
         Returns:
             Dictionnaire contenant les résultats d'entraînement
         """
         logger.info("Entraînement du modèle XGBoost...")
         
-        # Normalisation des features
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Split train/test
+        # Split train/test AVANT normalisation (pour garder les noms de colonnes)
         test_size = self.config.get('test_size', 0.2)
         random_state = self.config.get('random_state', 42)
         
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_scaled, y, 
+        X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+            X, y, 
             test_size=test_size, 
             random_state=random_state
         )
         
-        logger.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
+        logger.info(f"Train: {X_train_raw.shape}, Test: {X_test_raw.shape}")
+        
+        # Normalisation des features APRÈS le split
+        X_train = self.scaler.fit_transform(X_train_raw)
+        X_test = self.scaler.transform(X_test_raw)
         
         # Configuration du modèle
         model_params = self.config.get('model_params', {
@@ -1098,17 +1248,29 @@ class XGBoostOccupancyPredictor:
         y_pred_train = self.model.predict(X_train)
         y_pred_test = self.model.predict(X_test)
         
+        # Sauvegarder les prédictions de test avec stay_date et hotCode
+        if df_complete is not None:
+            # Récupérer stay_date et hotCode pour le set de test
+            test_indices = X_test_raw.index
+            df_test_info = df_complete.loc[test_indices, ['stay_date', 'hotCode']].copy() if 'stay_date' in df_complete.columns else None
+            self._save_test_predictions(X_test_raw, y_test, y_pred_test, df_test_info)
+        else:
+            self._save_test_predictions(X_test_raw, y_test, y_pred_test, None)
+        
         # Métriques
+        train_r2 = r2_score(y_train, y_pred_train)
+        test_r2 = r2_score(y_test, y_pred_test)
+        
         results = {
             'train': {
                 'mae': mean_absolute_error(y_train, y_pred_train),
                 'rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
-                'r2': r2_score(y_train, y_pred_train)
+                'r2': train_r2
             },
             'test': {
                 'mae': mean_absolute_error(y_test, y_pred_test),
                 'rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
-                'r2': r2_score(y_test, y_pred_test)
+                'r2': test_r2
             },
             'y_test': y_test,
             'y_pred_test': y_pred_test,
@@ -1116,6 +1278,12 @@ class XGBoostOccupancyPredictor:
         }
         
         self.results = results
+        
+        # Validation du R²
+        if test_r2 < -1 or test_r2 > 1.1:  # Tolérance de 1.1 pour arrondi
+            logger.warning(f"⚠️  ATTENTION: R² test anormal ({test_r2:.6f})")
+            logger.warning(f"   Statistiques y_test: min={y_test.min():.4f}, max={y_test.max():.4f}, mean={y_test.mean():.4f}")
+            logger.warning(f"   Statistiques y_pred: min={y_pred_test.min():.4f}, max={y_pred_test.max():.4f}, mean={y_pred_test.mean():.4f}")
         
         logger.info(f"📊 Test MAE: {results['test']['mae']:.4f}")
         logger.info(f"📊 Test R²: {results['test']['r2']:.4f}")
@@ -1167,7 +1335,7 @@ class XGBoostOccupancyPredictor:
         ax.grid(True)
         
         if save_plots:
-            results_dir = "results/D09"
+            results_dir = self._get_output_dir()
             os.makedirs(results_dir, exist_ok=True)
             plot_path = os.path.join(results_dir, "xgb_scatter_plot.png")
             plt.savefig(plot_path)
@@ -1185,7 +1353,7 @@ class XGBoostOccupancyPredictor:
         ax.set_xlabel("Importance")
         
         if save_plots:
-            results_dir = "results/D09"
+            results_dir = self._get_output_dir()
             os.makedirs(results_dir, exist_ok=True)
             plot_path = os.path.join(results_dir, "xgb_feature_importance.png")
             plt.savefig(plot_path, bbox_inches='tight')
@@ -1193,13 +1361,18 @@ class XGBoostOccupancyPredictor:
         
         plt.close()
     
-    def save_model_locally(self, model_dir: str = "results/D09/models"):
+    def save_model_locally(self, model_dir: str = None):
         """
         Sauvegarde le modèle et le scaler localement.
         
         Args:
-            model_dir: Répertoire de sauvegarde
+            model_dir: Répertoire de sauvegarde (optionnel)
         """
+        # Utiliser le répertoire de sortie de la config si non spécifié
+        if model_dir is None:
+            output_dir = self._get_output_dir()
+            model_dir = os.path.join(output_dir, "models")
+        
         logger.info(f"Sauvegarde locale du modèle dans {model_dir}...")
         
         os.makedirs(model_dir, exist_ok=True)
@@ -1221,9 +1394,9 @@ class XGBoostOccupancyPredictor:
         
         return model_path, scaler_path, features_path
     
-    def save_to_azure_blob(self, local_paths: List[str], container_name: str = "prediction-demande"):
+    def save_to_azure_blob(self, local_paths: List[str], container_name: str = "ml-models"):
         """
-        Sauvegarde les fichiers dans Azure Blob Storage.
+        Sauvegarde les fichiers dans Azure Blob Storage avec la structure predictTo/{hotel}/J-{horizon}/.
         
         Args:
             local_paths: Liste des chemins de fichiers locaux à uploader
@@ -1235,8 +1408,11 @@ class XGBoostOccupancyPredictor:
             connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
             
             if not connection_string:
-                logger.warning("AZURE_STORAGE_CONNECTION_STRING non définie. Sauvegarde Azure ignorée.")
+                logger.warning("⚠️  AZURE_STORAGE_CONNECTION_STRING non définie. Sauvegarde Azure ignorée.")
                 return
+            
+            logger.info(f"☁️  Sauvegarde dans Azure Blob Storage...")
+            logger.info(f"   Container: {container_name}")
             
             # Créer le client Blob
             blob_service_client = BlobServiceClient.from_connection_string(connection_string)
@@ -1245,19 +1421,34 @@ class XGBoostOccupancyPredictor:
             try:
                 container_client = blob_service_client.get_container_client(container_name)
                 container_client.get_container_properties()
+                logger.info(f"   Container existant trouvé")
             except ResourceNotFoundError:
                 container_client = blob_service_client.create_container(container_name)
+                logger.info(f"   Nouveau container créé")
+            
+            # Construire le chemin de base dans Azure : predictTo/{hotel}/J-{horizon}/
+            horizon = self.config.get('prediction_horizon', 7)
+            hotel_folder = self.hotel_code if self.hotel_code else "ALL"
+            azure_base_path = f"predictTo/{hotel_folder}/J-{horizon}"
+            
+            logger.info(f"   Chemin Azure: {azure_base_path}/")
             
             # Uploader chaque fichier
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+            uploaded_count = 0
             for local_path in local_paths:
                 if not os.path.exists(local_path):
-                    logger.warning(f"Fichier {local_path} non trouvé, ignoré")
+                    logger.warning(f"   ⚠️  Fichier {local_path} non trouvé, ignoré")
                     continue
                 
+                # Déterminer le chemin relatif du fichier
+                # Si le fichier est dans un sous-dossier "models", le préserver
                 filename = os.path.basename(local_path)
-                blob_name = f"models/{timestamp}/{filename}"
+                parent_dir = os.path.basename(os.path.dirname(local_path))
+                
+                if parent_dir == "models":
+                    blob_name = f"{azure_base_path}/models/{filename}"
+                else:
+                    blob_name = f"{azure_base_path}/{filename}"
                 
                 blob_client = blob_service_client.get_blob_client(
                     container=container_name, 
@@ -1266,6 +1457,11 @@ class XGBoostOccupancyPredictor:
                 
                 with open(local_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
+                    uploaded_count += 1
+                    logger.info(f"   ✓ {blob_name}")
+            
+            logger.info(f"✅ {uploaded_count} fichier(s) uploadé(s) dans Azure Blob Storage")
+            logger.info(f"   URL: {container_name}/{azure_base_path}/")
             
         except Exception as e:
             logger.error(f"❌ Erreur lors de la sauvegarde Azure: {e}")
@@ -1283,9 +1479,10 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
         Dictionnaire de configuration
     """
     default_config = {
-        'clustering_results_path': '../results/D09/clustering_results.csv',
-        'indicateurs_path': '../data/D09/Indicateurs.csv',
-        'rateShopper_path': '../data/D09/rateShopper.csv',
+        'clustering_base_dir': '../cluster/results',
+        'clustering_results_path': '../cluster/results/{hotCode}/clustering_results.csv',
+        'indicateurs_path': '../data/{hotCode}/Indicateurs.csv',
+        'rateShopper_path': '../data/{hotCode}/rateShopper.csv',
         'prediction_horizon': 7,
         'test_size': 0.2,
         'random_state': 42,
@@ -1300,9 +1497,9 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
             'n_jobs': -1,
             'random_state': 42
         },
-        'azure_container': 'prediction-demande',
+        'azure_container': 'ml-models',
         'save_to_azure': True,
-        'model_dir': 'results/D09/models',
+        'output_base_dir': 'results',  # Sera complété par {hotCode} dans _get_output_dir()
         'hyperparam_search': {
             'n_iter': 30,
             'cv_folds': 3
@@ -1316,9 +1513,10 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
             
             # Mapper le format YAML vers le format attendu
             config = {
+                'clustering_base_dir': yaml_config['data'].get('clustering_base_dir', '../cluster/results'),
                 'clustering_results_path': yaml_config['data']['clustering_results'],
                 'indicateurs_path': yaml_config['data']['indicateurs'],
-                'rateShopper_path': yaml_config['data'].get('rateShopper', '../data/D09/rateShopper.csv'),
+                'rateShopper_path': yaml_config['data'].get('rateShopper', '../data/{hotCode}/rateShopper.csv'),
                 'prediction_horizon': yaml_config['prediction']['horizon'],
                 'test_size': yaml_config['training']['test_size'],
                 'random_state': yaml_config['training']['random_state'],
@@ -1328,7 +1526,7 @@ def load_config(config_path: str = "config_predictTo.yaml") -> Dict[str, Any]:
                 },
                 'azure_container': yaml_config['azure']['container_name'],
                 'save_to_azure': yaml_config['azure']['save_to_blob'],
-                'model_dir': yaml_config['output']['model_dir'],
+                'output_base_dir': yaml_config['output'].get('base_dir', 'results/D09'),
                 'hyperparam_search': yaml_config.get('hyperparam_search', {'n_iter': 30, 'cv_folds': 3})
             }
             logger.info(f"✅ Configuration chargée depuis {config_path}")
@@ -1371,6 +1569,18 @@ def main():
         action='store_true',
         help='Activer la recherche d\'hyperparamètres avant l\'entraînement'
     )
+    parser.add_argument(
+        '--horizon',
+        type=int,
+        default=None,
+        help='Horizon de prédiction en jours (ex: 7 pour J+7). Override la valeur du fichier config.'
+    )
+    parser.add_argument(
+        '--hotel',
+        type=str,
+        default=None,
+        help='Code de l\'hôtel pour entraîner un modèle spécifique (ex: D09). Si non spécifié, entraîne sur tous les hôtels.'
+    )
     args = parser.parse_args()
     
     logger.info("=" * 80)
@@ -1394,18 +1604,42 @@ def main():
     if args.no_azure:
         config['save_to_azure'] = False
     
+    # Override horizon si fourni
+    if args.horizon is not None:
+        if args.horizon < 0:
+            logger.error("❌ L'horizon doit être un entier positif ou zéro")
+            sys.exit(1)
+        if args.horizon >= 60:
+            logger.error("❌ L'horizon maximum est 59 (car les données vont jusqu'à J-60)")
+            logger.error("   Pour prédire à J-60, il faudrait des données jusqu'à J-61 minimum")
+            sys.exit(1)
+        logger.info(f"🔧 Override de l'horizon: {config['prediction_horizon']} → {args.horizon}")
+        config['prediction_horizon'] = args.horizon
+    
     try:
         # Initialiser le prédicteur
-        predictor = XGBoostOccupancyPredictor(config)
+        predictor = XGBoostOccupancyPredictor(config, hotel_code=args.hotel)
         
         # 1. Charger les données
         clusters, indicateurs = predictor.load_data()
+        
+        # Filtrer par hôtel si spécifié
+        if args.hotel:
+            logger.info(f"🏨 Filtrage des données pour l'hôtel: {args.hotel}")
+            clusters = clusters[clusters['hotCode'] == args.hotel]
+            indicateurs = indicateurs[indicateurs['hotCode'] == args.hotel]
+            logger.info(f"   Clusters filtrés: {clusters.shape}")
+            logger.info(f"   Indicateurs filtrés: {indicateurs.shape}")
+            
+            if len(clusters) == 0:
+                logger.error(f"❌ Aucune donnée trouvée pour l'hôtel {args.hotel}")
+                sys.exit(1)
         
         # 2. Préparer les données
         df = predictor.prepare_data(clusters, indicateurs)
         
         # 3. Créer les features et target
-        X, y = predictor.create_features_target(df)
+        X, y, df_complete = predictor.create_features_target(df)
         
         # 4. Recherche d'hyperparamètres (optionnel)
         if args.search_hyperparams:
@@ -1419,19 +1653,40 @@ def main():
             predictor.config = config
         
         # 5. Entraîner le modèle (avec les meilleurs paramètres si recherche effectuée)
-        results = predictor.train_model(X, y)
+        results = predictor.train_model(X, y, df_complete)
         
         # 6. Évaluer le modèle
         predictor.evaluate_model(save_plots=True)
         
-        # 7. Sauvegarder localement
-        model_dir = config.get('model_dir', 'results/models')
-        local_paths = list(predictor.save_model_locally(model_dir))
+        # 7. Sauvegarder localement (le répertoire sera construit automatiquement selon hotel/horizon)
+        model_paths = list(predictor.save_model_locally())
         
         # 8. Sauvegarder dans Azure (si activé)
         if config.get('save_to_azure', False):
-            container_name = config.get('azure_container', 'prediction-demande')
-            predictor.save_to_azure_blob(local_paths, container_name)
+            container_name = config.get('azure_container', 'ml-models')
+            
+            # Collecter tous les fichiers à uploader (modèles + graphiques + CSV)
+            output_dir = predictor._get_output_dir()
+            files_to_upload = list(model_paths)
+            
+            # Ajouter les graphiques
+            scatter_plot = os.path.join(output_dir, "xgb_scatter_plot.png")
+            importance_plot = os.path.join(output_dir, "xgb_feature_importance.png")
+            if os.path.exists(scatter_plot):
+                files_to_upload.append(scatter_plot)
+            if os.path.exists(importance_plot):
+                files_to_upload.append(importance_plot)
+            
+            # Ajouter les CSV
+            training_csv = os.path.join(output_dir, "training_data_before_scaling.csv")
+            test_csv = os.path.join(output_dir, "test_predictions.csv")
+            if os.path.exists(training_csv):
+                files_to_upload.append(training_csv)
+            if os.path.exists(test_csv):
+                files_to_upload.append(test_csv)
+            
+            logger.info(f"\n📤 Préparation de l'upload Azure ({len(files_to_upload)} fichiers)...")
+            predictor.save_to_azure_blob(files_to_upload, container_name)
         
         logger.info("=" * 80)
         logger.info("✅ ENTRAÎNEMENT TERMINÉ AVEC SUCCÈS")
@@ -1439,10 +1694,18 @@ def main():
         
         # Afficher les métriques finales
         logger.info("\n📊 MÉTRIQUES FINALES:")
-        logger.info(f"   Train MAE: {results['train']['mae']:.4f}")
-        logger.info(f"   Train R²:  {results['train']['r2']:.4f}")
-        logger.info(f"   Test MAE:  {results['test']['mae']:.4f}")
-        logger.info(f"   Test R²:   {results['test']['r2']:.4f}")
+        logger.info(f"   Train MAE:  {results['train']['mae']:.4f}")
+        logger.info(f"   Train RMSE: {results['train']['rmse']:.4f}")
+        logger.info(f"   Train R²:   {results['train']['r2']:.4f}")
+        logger.info(f"   Test MAE:   {results['test']['mae']:.4f}")
+        logger.info(f"   Test RMSE:  {results['test']['rmse']:.4f}")
+        logger.info(f"   Test R²:    {results['test']['r2']:.4f}")
+        
+        # Vérification supplémentaire du R²
+        if results['test']['r2'] < 0:
+            logger.warning(f"\n⚠️  R² négatif détecté ! Le modèle performe moins bien qu'une simple moyenne.")
+        elif results['test']['r2'] > 1:
+            logger.error(f"\n❌ R² > 1 détecté ! Problème potentiel dans les données ou le calcul.")
         
     except Exception as e:
         logger.error(f"❌ ERREUR FATALE: {e}", exc_info=True)
